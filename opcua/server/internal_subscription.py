@@ -78,8 +78,8 @@ class MonitoredItemService(object):
 
     def trigger_datachange(self, handle, nodeid, attr):
         self.logger.debug("triggering datachange for handle %s, nodeid %s, and attribute %s", handle, nodeid, attr)
-        variant = self.aspace.get_attribute_value(nodeid, attr)
-        self.datachange_callback(handle, variant)
+        datavalue = self.aspace.get_attribute_value(nodeid, attr)
+        self.datachange_callback(handle, datavalue)
 
     def _modify_monitored_item(self, params):
         with self._lock:
@@ -99,7 +99,6 @@ class MonitoredItemService(object):
     def _commit_monitored_item(self, result, mdata):
         if result.StatusCode.is_good():
             self._monitored_items[result.MonitoredItemId] = mdata
-            self._monitored_item_counter += 1
 
     def _make_monitored_item_common(self, params):
         result = ua.MonitoredItemCreateResult()
@@ -370,34 +369,35 @@ class InternalSubscription(object):
     def republish(self, nb):
         self.logger.info("re-publish request for ack %s in subscription %s", nb, self)
         with self._lock:
-            notificationMessage = self._not_acknowledged_results.pop(nb, None)
-            if notificationMessage:
+            result = self._not_acknowledged_results.pop(nb, None)
+            if result:
                 self.logger.info("re-publishing ack %s in subscription %s", nb, self)
-                return notificationMessage
+                return result.NotificationMessage
             else:
                 self.logger.info("Error request to re-published non existing ack %s in subscription %s", nb, self)
                 return ua.NotificationMessage()
 
     def enqueue_datachange_event(self, mid, eventdata, maxsize):
-        self._enqueue_event(mid, eventdata, maxsize, self._triggered_datachanges)
+        with self._lock:
+            self._enqueue_event(mid, eventdata, maxsize, self._triggered_datachanges)
 
     def enqueue_event(self, mid, eventdata, maxsize):
-        self._enqueue_event(mid, eventdata, maxsize, self._triggered_events)
+        with self._lock:
+            self._enqueue_event(mid, eventdata, maxsize, self._triggered_events)
 
     def enqueue_statuschange(self, code):
         self._triggered_statuschanges.append(code)
         self._trigger_publish()
 
     def _enqueue_event(self, mid, eventdata, size, queue):
-        with self._lock:
-            if mid not in queue:
-                queue[mid] = [eventdata]
-                self._trigger_publish()
-                return
-            if size != 0:
-                if len(queue[mid]) >= size:
-                    queue[mid].pop(0)
-            queue[mid].append(eventdata)
+        if mid not in queue:
+            queue[mid] = [eventdata]
+            self._trigger_publish()
+            return
+        if size != 0:
+            if len(queue[mid]) >= size:
+                queue[mid].pop(0)
+        queue[mid].append(eventdata)
 
 
 class WhereClauseEvaluator(object):
@@ -423,30 +423,29 @@ class WhereClauseEvaluator(object):
         # ops = [self._eval_op(op, event) for op in el.FilterOperands]
         ops = el.FilterOperands  # just to make code more readable
         if el.FilterOperator == ua.FilterOperator.Equals:
-            return self._eval_op(ops[0], event) == self._eval_el(ops[1], event)
+            return self._eval_op(ops[0], event) == self._eval_op(ops[1], event)
         elif el.FilterOperator == ua.FilterOperator.IsNull:
             return self._eval_op(ops[0], event) is None  # FIXME: might be too strict
         elif el.FilterOperator == ua.FilterOperator.GreaterThan:
-            return self._eval_op(ops[0], event) > self._eval_el(ops[1], event)
+            return self._eval_op(ops[0], event) > self._eval_op(ops[1], event)
         elif el.FilterOperator == ua.FilterOperator.LessThan:
-            return self._eval_op(ops[0], event) < self._eval_el(ops[1], event)
+            return self._eval_op(ops[0], event) < self._eval_op(ops[1], event)
         elif el.FilterOperator == ua.FilterOperator.GreaterThanOrEqual:
-            return self._eval_op(ops[0], event) >= self._eval_el(ops[1], event)
+            return self._eval_op(ops[0], event) >= self._eval_op(ops[1], event)
         elif el.FilterOperator == ua.FilterOperator.LessThanOrEqual:
-            return self._eval_op(ops[0], event) <= self._eval_el(ops[1], event)
+            return self._eval_op(ops[0], event) <= self._eval_op(ops[1], event)
         elif el.FilterOperator == ua.FilterOperator.Like:
-            return self._likeoperator(self._eval_op(ops[0], event), self._eval_el(ops[1], event))
+            return self._likeoperator(self._eval_op(ops[0], event), self._eval_op(ops[1], event))
         elif el.FilterOperator == ua.FilterOperator.Not:
             return not self._eval_op(ops[0], event)
         elif el.FilterOperator == ua.FilterOperator.Between:
-            return self._eval_el(ops[2], event) >= self._eval_op(ops[0], event) >= self._eval_el(ops[1], event)
+            return self._eval_el(ops[2], event) >= self._eval_op(ops[0], event) >= self._eval_op(ops[1], event)
         elif el.FilterOperator == ua.FilterOperator.InList:
             return self._eval_op(ops[0], event) in [self._eval_op(op, event) for op in ops[1:]]
         elif el.FilterOperator == ua.FilterOperator.And:
-            self.elements(ops[0].Index)
             return self._eval_op(ops[0], event) and self._eval_op(ops[1], event)
         elif el.FilterOperator == ua.FilterOperator.Or:
-            return self._eval_op(ops[0], event) or self._eval_el(ops[1], event)
+            return self._eval_op(ops[0], event) or self._eval_op(ops[1], event)
         elif el.FilterOperator == ua.FilterOperator.Cast:
             self.logger.warn("Cast operand not implemented, assuming True")
             return True

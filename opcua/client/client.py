@@ -15,6 +15,7 @@ from opcua.common.node import Node
 from opcua.common.manage_nodes import delete_nodes
 from opcua.common.subscription import Subscription
 from opcua.common import utils
+from opcua.common import ua_utils
 from opcua.crypto import security_policies
 from opcua.common.shortcuts import Shortcuts
 from opcua.common.structures import load_type_definitions, load_enums
@@ -22,8 +23,10 @@ use_crypto = True
 try:
     from opcua.crypto import uacrypto
 except ImportError:
-    logging.getLogger(__name__).warning("cryptography is not installed, use of crypto disabled")
     use_crypto = False
+
+
+_logger = logging.getLogger(__name__)
 
 
 class KeepAlive(Thread):
@@ -39,7 +42,7 @@ class KeepAlive(Thread):
             in milliseconds.
         """
         Thread.__init__(self)
-        self.logger = logging.getLogger(__name__)
+        _logger = logging.getLogger(__name__)
 
         self.client = client
         self._dostop = False
@@ -51,25 +54,25 @@ class KeepAlive(Thread):
             self.timeout = 3600000  # 1 hour
 
     def run(self):
-        self.logger.debug("starting keepalive thread with period of %s milliseconds", self.timeout)
+        _logger.debug("starting keepalive thread with period of %s milliseconds", self.timeout)
         server_state = self.client.get_node(ua.FourByteNodeId(ua.ObjectIds.Server_ServerStatus_State))
         while not self._dostop:
             with self._cond:
                 self._cond.wait(self.timeout / 1000)
             if self._dostop:
                 break
-            self.logger.debug("renewing channel")
+            _logger.debug("renewing channel")
             try:
                 self.client.open_secure_channel(renew=True)
             except concurrent.futures.TimeoutError:
-                self.logger.debug("keepalive failed: timeout on open_secure_channel()")
+                _logger.debug("keepalive failed: timeout on open_secure_channel()")
                 break
             val = server_state.get_value()
-            self.logger.debug("server state is: %s ", val)
-        self.logger.debug("keepalive thread has stopped")
+            _logger.debug("server state is: %s ", val)
+        _logger.debug("keepalive thread has stopped")
 
     def stop(self):
-        self.logger.debug("stoping keepalive thread")
+        _logger.debug("stoping keepalive thread")
         self._dostop = True
         with self._cond:
             self._cond.notify_all()
@@ -86,6 +89,9 @@ class Client(object):
     the raw OPC-UA services interface.
     """
 
+    if use_crypto is False:
+        logging.getLogger(__name__).warning("cryptography is not installed, use of crypto disabled")
+
     def __init__(self, url, timeout=4):
         """
 
@@ -96,8 +102,19 @@ class Client(object):
         :param timeout:
             Each request sent to the server expects an answer within this
             time. The timeout is specified in seconds.
+
+        Some other client parameters can be changed by setting
+        attributes on the constructed object:
+
+        secure_channel_timeout
+            Timeout for the secure channel, specified in milliseconds.
+
+        session_timeout
+            Timeout for the session, specified in milliseconds.
+
+        See the source code for the exhaustive list.
         """
-        self.logger = logging.getLogger(__name__)
+        _logger = logging.getLogger(__name__)
         self.server_url = urlparse(url)
         # take initial username and password from the url
         self._username = self.server_url.username
@@ -256,11 +273,21 @@ class Client(object):
         try:
             self.send_hello()
             self.open_secure_channel()
-            self.create_session()
+            try:
+                self.create_session()
+                try:
+                    self.activate_session(username=self._username, password=self._password, certificate=self.user_certificate)
+                except Exception:
+                    # clean up the session
+                    self.close_session()
+                    raise
+            except Exception:
+                # clean up the secure channel
+                self.close_secure_channel()
+                raise
         except Exception:
             self.disconnect_socket()  # clean up open socket
             raise
-        self.activate_session(username=self._username, password=self._password, certificate=self.user_certificate)
 
     def disconnect(self):
         """
@@ -304,11 +331,13 @@ class Client(object):
         params.SecurityMode = self.security_policy.Mode
         params.RequestedLifetime = self.secure_channel_timeout
         # length should be equal to the length of key of symmetric encryption
-        nonce = utils.create_nonce(self.security_policy.symmetric_key_size)
-        params.ClientNonce = nonce  # this nonce is used to create a symmetric key
+        params.ClientNonce = utils.create_nonce(self.security_policy.symmetric_key_size) # this nonce is used to create a symmetric key
         result = self.uaclient.open_secure_channel(params)
-        self.security_policy.make_symmetric_key(nonce, result.ServerNonce)
-        self.secure_channel_timeout = result.SecurityToken.RevisedLifetime
+        if self.secure_channel_timeout != result.SecurityToken.RevisedLifetime:
+            _logger.warning("Requested secure channel timeout to be %dms, got %dms instead",
+                                self.secure_channel_timeout,
+                                result.SecurityToken.RevisedLifetime)
+            self.secure_channel_timeout = result.SecurityToken.RevisedLifetime
 
     def close_secure_channel(self):
         return self.uaclient.close_secure_channel()
@@ -355,7 +384,7 @@ class Client(object):
         params.ClientDescription = desc
         params.EndpointUrl = self.server_url.geturl()
         params.SessionName = self.description + " Session" + str(self._session_counter)
-        params.RequestedSessionTimeout = 3600000
+        params.RequestedSessionTimeout = self.session_timeout
         params.MaxResponseMessageSize = 0  # means no max size
         response = self.uaclient.create_session(params)
         if self.security_policy.client_certificate is None:
@@ -371,7 +400,11 @@ class Client(object):
         # remember PolicyId's: we will use them in activate_session()
         ep = Client.find_endpoint(response.ServerEndpoints, self.security_policy.Mode, self.security_policy.URI)
         self._policy_ids = ep.UserIdentityTokens
-        self.session_timeout = response.RevisedSessionTimeout
+        if self.session_timeout != response.RevisedSessionTimeout:
+            _logger.warning("Requested session timeout to be %dms, got %dms instead",
+                                self.secure_channel_timeout,
+                                response.RevisedSessionTimeout)
+            self.session_timeout = response.RevisedSessionTimeout
         self.keepalive = KeepAlive(
             self, min(self.session_timeout, self.secure_channel_timeout) * 0.7)  # 0.7 is from spec
         self.keepalive.start()
@@ -411,7 +444,15 @@ class Client(object):
             challenge += self.security_policy.server_certificate
         if self._server_nonce is not None:
             challenge += self._server_nonce
-        params.ClientSignature.Algorithm = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
+
+        if self.security_policy.AsymmetricSignatureURI:
+            params.ClientSignature.Algorithm = (
+                self.security_policy.AsymmetricSignatureURI
+            )
+        else:
+            params.ClientSignature.Algorithm = (
+                security_policies.SecurityPolicyBasic256.AsymmetricSignatureURI
+            )
         params.ClientSignature.Signature = self.security_policy.asymmetric_cryptography.signature(challenge)
         params.LocaleIds.append("en")
         if not username and not certificate:
@@ -428,14 +469,20 @@ class Client(object):
 
     def _add_certificate_auth(self, params, certificate, challenge):
         params.UserIdentityToken = ua.X509IdentityToken()
-        params.UserIdentityToken.PolicyId = self.server_policy_id(ua.UserTokenType.Certificate, "certificate_basic256")
         params.UserIdentityToken.CertificateData = uacrypto.der_from_x509(certificate)
         # specs part 4, 5.6.3.1: the data to sign is created by appending
         # the last serverNonce to the serverCertificate
-        sig = uacrypto.sign_sha1(self.user_private_key, challenge)
         params.UserTokenSignature = ua.SignatureData()
-        params.UserTokenSignature.Algorithm = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
-        params.UserTokenSignature.Signature = sig
+        if certificate.signature_hash_algorithm.name == "sha256":
+            params.UserIdentityToken.PolicyId = self.server_policy_id(ua.UserTokenType.Certificate, "certificate_basic256sha256")
+            sig = uacrypto.sign_sha256(self.user_private_key, challenge)
+            params.UserTokenSignature.Algorithm = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+            params.UserTokenSignature.Signature = sig
+        else:
+            params.UserIdentityToken.PolicyId = self.server_policy_id(ua.UserTokenType.Certificate, "certificate_basic256")
+            sig = uacrypto.sign_sha1(self.user_private_key, challenge)
+            params.UserTokenSignature.Algorithm = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
+            params.UserTokenSignature.Signature = sig
 
     def _add_user_auth(self, params, username, password):
         params.UserIdentityToken = ua.UserNameIdentityToken()
@@ -446,7 +493,7 @@ class Client(object):
             # then the password only contains UTF-8 encoded password
             # and EncryptionAlgorithm is null
             if self._password:
-                self.logger.warning("Sending plain-text password")
+                _logger.warning("Sending plain-text password")
                 params.UserIdentityToken.Password = password.encode('utf8')
             params.UserIdentityToken.EncryptionAlgorithm = None
         elif self._password:
@@ -516,6 +563,20 @@ class Client(object):
         params.PublishingEnabled = True
         params.Priority = 0
         return Subscription(self.uaclient, params, handler)
+
+    def reconciliate_subscription(self, subscription):
+        """
+        Reconciliate the server state with the client
+        """
+        node = self.get_node(
+            ua.FourByteNodeId(ua.ObjectIds.Server)
+        )
+        # returns server and client handles
+        monitored_items = node.call_method(
+            ua.uatypes.QualifiedName("GetMonitoredItems"),
+            ua.Variant(subscription.subscription_id, ua.VariantType.UInt32)
+        )
+        return subscription.reconciliate(monitored_items)
 
     def get_namespace_array(self):
         ns_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_NamespaceArray))
@@ -599,5 +660,16 @@ class Client(object):
         Read the value of multiple nodes in one roundtrip.
         """
         nodes = [node.nodeid for node in nodes]
-        results = self.uaclient.get_attribute(nodes, ua.AttributeIds.Value)
+        results = self.uaclient.get_attributes(nodes, ua.AttributeIds.Value)
         return [result.Value.Value for result in results]
+
+    def set_values(self, nodes, values):
+        """
+        Write values to multiple nodes in one ua call
+        """
+        nodeids = [node.nodeid for node in nodes]
+        dvs = [ua_utils.value_to_datavalue(val) for val in values]
+        results = self.uaclient.set_attributes(nodeids, dvs, ua.AttributeIds.Value)
+        for result in results:
+            result.check()
+

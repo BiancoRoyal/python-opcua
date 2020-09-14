@@ -5,6 +5,7 @@ implement ua datatypes
 import logging
 from enum import Enum, IntEnum
 from calendar import timegm
+import pytz
 import sys
 import os
 import uuid
@@ -29,26 +30,12 @@ HUNDREDS_OF_NANOSECONDS = 10000000
 FILETIME_EPOCH_AS_DATETIME = datetime(1601, 1, 1)
 
 
-class UTC(tzinfo):
-    """
-    UTC
-    """
-
-    def utcoffset(self, dt):
-        return timedelta(0)
-
-    def tzname(self, dt):
-        return "UTC"
-
-    def dst(self, dt):
-        return timedelta(0)
-
-
-
 # method copied from David Buxton <david@gasmark6.com> sample code
 def datetime_to_win_epoch(dt):
     if (dt.tzinfo is None) or (dt.tzinfo.utcoffset(dt) is None):
-        dt = dt.replace(tzinfo=UTC())
+        dt = dt.replace(tzinfo=pytz.utc)
+    else:
+        dt = dt.astimezone(tz=pytz.utc)
     ft = EPOCH_AS_FILETIME + (timegm(dt.timetuple()) * HUNDREDS_OF_NANOSECONDS)
     return ft + (dt.microsecond * 10)
 
@@ -301,7 +288,10 @@ class NodeId(object):
         self._freeze = True
         if self.Identifier is None:
             self.Identifier = 0
-            self.NodeIdType = NodeIdType.TwoByte
+            if namespaceidx == 0:
+                self.NodeIdType = NodeIdType.TwoByte
+            else:  # TwoByte NodeId does not encode namespace.
+                self.NodeIdType = NodeIdType.Numeric
             return
         if self.NodeIdType is None:
             if isinstance(self.Identifier, int):
@@ -337,7 +327,7 @@ class NodeId(object):
     def has_null_identifier(self):
         if not self.Identifier:
             return True
-        if self.NodeIdType == NodeIdType.Guid and re.match(b'0.', self.Identifier):
+        if self.NodeIdType == NodeIdType.Guid and re.match(b'\x00+', self.Identifier.bytes):
             return True
         return False
 
@@ -519,8 +509,8 @@ class LocalizedText(FrozenClass):
     }
 
     ua_types = (
-            ('Encoding', 'Byte'), 
-            ('Locale', 'String'), 
+            ('Encoding', 'Byte'),
+            ('Locale', 'String'),
             ('Text', 'String'), )
 
     def __init__(self, text=None):
@@ -537,7 +527,11 @@ class LocalizedText(FrozenClass):
 
     @Text.setter
     def Text(self, text):
-        if not isinstance(text, str):
+        if isinstance(text, str):
+            pass
+        elif isinstance(text, bytes):
+            text = text.decode()
+        else:
             raise ValueError("A LocalizedText object takes a string as argument, not a {}, {}".format(type(text), text))
         self._text = text
         if self._text:
@@ -579,9 +573,9 @@ class ExtensionObject(FrozenClass):
     }
 
     ua_types = (
-            ("TypeId", "NodeId"), 
-            ("Encoding", "Byte"), 
-            ("Body", "ByteString"), 
+            ("TypeId", "NodeId"),
+            ("Encoding", "Byte"),
+            ("Body", "ByteString"),
             )
 
     def __init__(self):
@@ -772,10 +766,22 @@ class Variant(FrozenClass):
     def _guess_type(self, val):
         if isinstance(val, (list, tuple)):
             error_val = val
-        while isinstance(val, (list, tuple)):
-            if len(val) == 0:
-                raise UaError("could not guess UA type of variable {0}".format(error_val))
-            val = val[0]
+            while val and isinstance(val[0], (list, tuple)):
+                val = val[0]
+
+            types = {type(el) for el in val}
+            if len(types) == 0:
+                raise UaError("List of zero length. Could not guess UA type of variable {0}".format(error_val))
+            elif types == set([int, float]):
+                logger.debug(
+                    "Variable {0} has ints and floats. UA type will be {1}".format(error_val, VariantType.Double)
+                )
+                val = float()
+            elif len(types) > 1:
+                raise UaError("List of multiple types. Could not guess UA type of variable {0}".format(error_val))
+            else:
+                val = val[0]
+
         if val is None:
             return VariantType.Null
         elif isinstance(val, bool):
@@ -877,16 +883,16 @@ class DataValue(FrozenClass):
     }
 
     ua_types = (
-            ('Encoding', 'Byte'), 
-            ('Value', 'Variant'), 
-            ('StatusCode', 'StatusCode'), 
+            ('Encoding', 'Byte'),
+            ('Value', 'Variant'),
+            ('StatusCode', 'StatusCode'),
             ('SourceTimestamp', 'DateTime'),
-            ('SourcePicoseconds', 'UInt16'), 
-            ('ServerTimestamp', 'DateTime'), 
-            ('ServerPicoseconds', 'UInt16'), 
+            ('SourcePicoseconds', 'UInt16'),
+            ('ServerTimestamp', 'DateTime'),
+            ('ServerPicoseconds', 'UInt16'),
             )
-
-    def __init__(self, variant=None, status=None):
+    
+    def __init__(self, variant=None, status=None, sourceTimestamp=None, sourcePicoseconds=None, serverTimestamp=None, serverPicoseconds=None):
         self.Encoding = 0
         if not isinstance(variant, Variant):
             variant = Variant(variant)
@@ -895,10 +901,10 @@ class DataValue(FrozenClass):
             self.StatusCode = StatusCode()
         else:
             self.StatusCode = status
-        self.SourceTimestamp = None  # DateTime()
-        self.SourcePicoseconds = None
-        self.ServerTimestamp = None  # DateTime()
-        self.ServerPicoseconds = None
+        self.SourceTimestamp = sourceTimestamp
+        self.SourcePicoseconds = sourcePicoseconds
+        self.ServerTimestamp = serverTimestamp
+        self.ServerPicoseconds = serverPicoseconds
         self._freeze = True
 
     def __str__(self):
@@ -1011,7 +1017,7 @@ def get_extensionobject_class_type(typeid):
 class SecurityPolicyType(Enum):
     """
     The supported types of SecurityPolicy.
-    
+
     "None"
     "Basic128Rsa15_Sign"
     "Basic128Rsa15_SignAndEncrypt"

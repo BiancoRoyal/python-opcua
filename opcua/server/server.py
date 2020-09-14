@@ -31,7 +31,6 @@ use_crypto = True
 try:
     from opcua.crypto import uacrypto
 except ImportError:
-    logging.getLogger(__name__).warning("cryptography is not installed, use of crypto disabled")
     use_crypto = False
 
 
@@ -75,6 +74,9 @@ class Server(object):
 
     """
 
+    if use_crypto is False:
+        logging.getLogger(__name__).warning("cryptography is not installed, use of crypto disabled")
+
     def __init__(self, shelffile=None, iserver=None):
         self.logger = logging.getLogger(__name__)
         self.endpoint = urlparse("opc.tcp://0.0.0.0:4840/freeopcua/server/")
@@ -96,19 +98,8 @@ class Server(object):
         self.set_application_uri(self._application_uri)
         sa_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerArray))
         sa_node.set_value([self._application_uri])
-        status_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus))
-        build_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo))
-        status = ua.ServerStatusDataType()
-        status.BuildInfo.ProductUri = self.product_uri
-        status.BuildInfo.ManufacturerName = self.manufacturer_name
-        status.BuildInfo.ProductName = self.name
-        status.BuildInfo.SoftwareVersion = "1.0pre"
-        status.BuildInfo.BuildNumber = "0"
-        status.BuildInfo.BuildDate = datetime.now()
-        status.SecondsTillShutdown = 0
-        status_node.set_value(status)
-        build_node.set_value(status.BuildInfo)
 
+        self.set_build_info(self.product_uri, self.manufacturer_name, self.name, "1.0pre", "0", datetime.now())
 
         # enable all endpoints by default
         self.certificate = None
@@ -224,7 +215,7 @@ class Server(object):
 
             E.g. to limit the number of IDs and disable anonymous clients:
 
-                set_security_policy(["Basic256Sha256"])
+                set_security_IDs(["Basic256Sha256"])
 
             (Implementation for ID check is currently not finalized...)
 
@@ -303,6 +294,41 @@ class Server(object):
 
     def set_server_name(self, name):
         self.name = name
+
+    def set_build_info(self, product_uri, manufacturer_name, product_name, software_version, build_number, build_date):
+        """
+        Update the servers build information.
+        This needs to be added to the ServerStatus, BuildInfo and all underlying nodes
+        """
+        status_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus))
+        build_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo))
+        status = status_node.get_value()
+        if status is None:
+            status = ua.ServerStatusDataType()
+
+        status.BuildInfo.ProductUri = product_uri
+        status.BuildInfo.ManufacturerName = manufacturer_name
+        status.BuildInfo.ProductName = product_name
+        status.BuildInfo.SoftwareVersion = software_version
+        status.BuildInfo.BuildNumber = build_number
+        status.BuildInfo.BuildDate = build_date
+        status_node.set_value(status)
+        build_node.set_value(status.BuildInfo)
+
+        # we also need to update all individual nodes :/
+        product_uri_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ProductUri))
+        product_name_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ProductName))
+        product_manufacturer_name_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ManufacturerName))
+        product_software_version_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_SoftwareVersion))
+        product_build_number_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_BuildNumber))
+        product_build_date_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_BuildDate))
+
+        product_uri_node.set_value(status.BuildInfo.ProductUri)
+        product_name_node.set_value(status.BuildInfo.ProductName)
+        product_manufacturer_name_node.set_value(status.BuildInfo.ManufacturerName)
+        product_software_version_node.set_value(status.BuildInfo.SoftwareVersion)
+        product_build_number_node.set_value(status.BuildInfo.BuildNumber)
+        product_build_date_node.set_value(status.BuildInfo.BuildDate)
 
     def start(self):
         """
@@ -406,10 +432,25 @@ class Server(object):
             etype = BaseEvent()
         return EventGenerator(self.iserver.isession, etype, emitting_node=emitting_node)
 
-    def create_custom_data_type(self, idx, name, basetype=ua.ObjectIds.BaseDataType, properties=None):
+    def create_custom_data_type(self, idx, name, basetype=ua.ObjectIds.BaseDataType, properties=None, description=None):
         if properties is None:
             properties = []
-        return self._create_custom_type(idx, name, basetype, properties, [], [])
+
+        if isinstance(basetype, Node):
+            base_t = basetype
+        elif isinstance(basetype, ua.NodeId):
+            base_t = Node(self.iserver.isession, basetype)
+        else:
+            base_t = Node(self.iserver.isession, ua.NodeId(basetype))
+
+        custom_t = base_t.add_data_type(idx, name, description)
+        for prop in properties:
+            datatype = None
+            if len(prop) > 2:
+                datatype = prop[2]
+            custom_t.add_property(idx, prop[0], ua.get_default_value(prop[1]), varianttype=prop[1], datatype=datatype)
+
+        return custom_t
 
     def create_custom_event_type(self, idx, name, basetype=ua.ObjectIds.BaseEventType, properties=None):
         if properties is None:

@@ -140,6 +140,9 @@ class _Primitive1(object):
     def pack_array(self, data):
         if data is None:
             return Primitives.Int32.pack(-1)
+        if not isinstance(data, list):
+            logger.warning('ua_binary.py > _Primitive1 > pack_array > data: {0} is not a instance of "list"!'.format(data))
+            return Primitives.Int32.pack(-1) #to prevent crashing while runtime
         sizedata = Primitives.Int32.pack(len(data))
         return sizedata + struct.pack(self._fmt.format(len(data)), *data)
 

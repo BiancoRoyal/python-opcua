@@ -6,7 +6,7 @@ import logging
 import socket
 import errno
 from threading import Thread, Lock
-from concurrent.futures import Future
+from concurrent.futures import Future, CancelledError
 from functools import partial
 
 from opcua import ua
@@ -63,6 +63,11 @@ class UASocketClient(object):
             if callback:
                 future.add_done_callback(callback)
             self._callbackmap[self._request_id] = future
+
+            # Change to the new security token if the connection has been renewed.
+            if self._connection.next_security_token.TokenId != 0:
+                self._connection.revolve_tokens()
+
             msg = self._connection.message_to_binary(binreq, message_type=message_type, request_id=self._request_id)
             self._socket.write(msg)
         return future
@@ -96,16 +101,18 @@ class UASocketClient(object):
                 self._receive()
             except ua.utils.SocketClosedException:
                 self.logger.info("Socket has closed connection")
+                self._connection.close()
                 break
             except UaError:
                 self.logger.exception("Protocol Error")
+        self._cancel_all_callbacks()
         self.logger.info("Thread ended")
 
     def _receive(self):
         msg = self._connection.receive_from_socket(self._socket)
         if msg is None:
             return
-        elif isinstance(msg, ua.Message):
+        if isinstance(msg, ua.Message):
             self._call_callback(msg.request_id(), msg.body())
         elif isinstance(msg, ua.Acknowledge):
             self._call_callback(0, msg)
@@ -113,7 +120,7 @@ class UASocketClient(object):
             self.logger.fatal("Received an error: %s", msg)
             self._call_callback(0, ua.UaStatusCodeError(msg.Error.value))
         else:
-            raise ua.UaError("Unsupported message type: %s", msg)
+            raise ua.UaError("Unsupported message type: {}".format(msg))
 
     def _call_callback(self, request_id, body):
         with self._lock:
@@ -124,6 +131,12 @@ class UASocketClient(object):
                     .format(request_id, self._callbackmap.keys())
                 )
         future.set_result(body)
+
+    def _cancel_all_callbacks(self):
+        for request_id, fut in self._callbackmap.items():
+            self.logger.info("Cancelling request {:d}".format(request_id))
+            fut.cancel()
+        self._callbackmap.clear()
 
     def _create_request_header(self, timeout=1000):
         hdr = ua.RequestHeader()
@@ -161,7 +174,7 @@ class UASocketClient(object):
         self.logger.info("Socket closed, waiting for receiver thread to terminate...")
         if self._thread and self._thread.is_alive():
             self._thread.join()
-        self._callbackmap.clear()
+        self._cancel_all_callbacks()
         self.logger.info("Done closing socket: Receiving thread terminated, socket disconnected")
 
     def send_hello(self, url, max_messagesize=0, max_chunkcount=0):
@@ -181,13 +194,21 @@ class UASocketClient(object):
         self.logger.info("open_secure_channel")
         request = ua.OpenSecureChannelRequest()
         request.Parameters = params
-        future = self._send_request(request, message_type=ua.MessageType.SecureOpen)
 
-        # FIXME: we have a race condition here
-        # we can get a packet with the new token id before we reach to store it..
-        response = struct_from_binary(ua.OpenSecureChannelResponse, future.result(self.timeout))
+        # use callback to make sure channel security parameters are set immedialty
+        # and we do no get race conditions
+        def clb(future):
+            response = struct_from_binary(ua.OpenSecureChannelResponse, future.result())
+            response.ResponseHeader.ServiceResult.check()
+            self._connection.set_channel(response.Parameters, params.RequestType, params.ClientNonce)
+            clb.future.set_result(response)
+        clb.future = Future()  # hack to have a variable only shared between a callback and us
+
+        self._send_request(request, message_type=ua.MessageType.SecureOpen, callback=clb)
+        # wait for our callbackto finish rexecuting before returning
+        response = clb.future.result(self.timeout)
         response.ResponseHeader.ServiceResult.check()
-        self._connection.set_channel(response.Parameters)
+
         return response.Parameters
 
     def close_secure_channel(self):
@@ -462,7 +483,10 @@ class UaClient(object):
 
     def _call_publish_callback(self, future):
         self.logger.info("call_publish_callback")
-        data = future.result()
+        try:
+            data = future.result()
+        except CancelledError:  # we are cancelled, we just return
+            return
 
         # check if answer looks ok
         try:
@@ -621,7 +645,7 @@ class UaClient(object):
         response.ResponseHeader.ServiceResult.check()
         # nothing to return for this service
 
-    def get_attribute(self, nodes, attr):
+    def get_attributes(self, nodes, attr):
         self.logger.info("get_attribute")
         request = ua.ReadRequest()
         for node in nodes:
@@ -633,3 +657,22 @@ class UaClient(object):
         response = struct_from_binary(ua.ReadResponse, data)
         response.ResponseHeader.ServiceResult.check()
         return response.Results
+
+    def set_attributes(self, nodeids, datavalues, attributeid=ua.AttributeIds.Value):
+        """
+        Set an attribute of multiple nodes
+        datavalue is a ua.DataValue object
+        """
+        self.logger.info("set_attributes of several nodes")
+        request = ua.WriteRequest()
+        for idx, nodeid in enumerate(nodeids):
+            attr = ua.WriteValue()
+            attr.NodeId = nodeid
+            attr.AttributeId = attributeid
+            attr.Value = datavalues[idx]
+            request.Parameters.NodesToWrite.append(attr)
+        data = self._uasocket.send_request(request)
+        response = struct_from_binary(ua.WriteResponse, data)
+        response.ResponseHeader.ServiceResult.check()
+        return response.Results
+

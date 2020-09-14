@@ -152,7 +152,7 @@ class InternalServer(object):
             attr = ua.WriteValue()
             attr.NodeId = ua.NodeId(nodeid)
             attr.AttributeId = ua.AttributeIds.Value
-            attr.Value = ua.DataValue(ua.Variant(10000), ua.StatusCode(ua.StatusCodes.Good))
+            attr.Value = ua.DataValue(ua.Variant(10000, ua.VariantType.UInt32), ua.StatusCode(ua.StatusCodes.Good))
             attr.Value.ServerTimestamp = datetime.utcnow()
             params.NodesToWrite.append(attr)
         result = self.isession.write(params)
@@ -176,7 +176,8 @@ class InternalServer(object):
         self.loop = utils.ThreadLoop()
         self.loop.start()
         self.subscription_service.set_loop(self.loop)
-        Node(self.isession, ua.NodeId(ua.ObjectIds.Server_ServerStatus_State)).set_value(0, ua.VariantType.Int32)
+        serverState = Node(self.isession, ua.NodeId(ua.ObjectIds.Server_ServerStatus_State))
+        serverState.set_value(ua.uaprotocol_auto.ServerState.Running, ua.VariantType.Int32)
         Node(self.isession, ua.NodeId(ua.ObjectIds.Server_ServerStatus_StartTime)).set_value(datetime.utcnow())
         if not self.disabled_clock:
             self._set_current_time()
@@ -184,11 +185,14 @@ class InternalServer(object):
     def stop(self):
         self.logger.info("stopping internal server")
         self.isession.close_session()
-        if self.loop:
-            self.loop.stop()
-            self.loop = None
         self.subscription_service.set_loop(None)
         self.history_manager.stop()
+        if self.loop:
+            self.loop.stop()
+            # wait for ThreadLoop to finish before proceeding
+            self.loop.join()
+            self.loop.close()
+            self.loop = None
 
     def is_running(self):
         return self.loop is not None
@@ -218,8 +222,8 @@ class InternalServer(object):
             return edps
         return self.endpoints[:]
 
-    def create_session(self, name, user=UserManager.User.Anonymous, external=False):
-        return self.session_cls(self, self.aspace, self.subscription_service, name, user=user, external=external)
+    def create_session(self, name, user=UserManager.User.Anonymous):
+        return self.session_cls(self, self.aspace, self.subscription_service, name, user=user)
 
     def enable_history_data_change(self, node, period=timedelta(days=7), count=0):
         """
@@ -284,10 +288,9 @@ class InternalSession(object):
     _counter = 10
     _auth_counter = 1000
 
-    def __init__(self, internal_server, aspace, submgr, name, user=UserManager.User.Anonymous, external=False):
+    def __init__(self, internal_server, aspace, submgr, name, user=UserManager.User.Anonymous):
         self.logger = logging.getLogger(__name__)
         self.iserver = internal_server
-        self.external = external  # define if session is external, we need to copy some objects if it is internal
         self.aspace = aspace
         self.subscription_service = submgr
         self.name = name

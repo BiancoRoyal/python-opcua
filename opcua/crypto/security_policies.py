@@ -1,4 +1,5 @@
 import logging
+import struct
 
 from abc import ABCMeta, abstractmethod
 from opcua.ua import CryptographyNone, SecurityPolicy
@@ -134,10 +135,14 @@ class Cryptography(CryptographyNone):
         if not self.is_encrypted:
             return b''
         block_size = self.Encryptor.plain_block_size()
-        rem = (size + self.signature_size() + 1) % block_size
+        extrapad_size = 2 if self.Encryptor.encrypted_block_size() > 256 else 1
+        rem = (size + self.signature_size() + extrapad_size) % block_size
         if rem != 0:
             rem = block_size - rem
-        return bytes(bytearray([rem])) * (rem + 1)
+        data = bytes(bytearray([rem%256])) * (rem + 1)
+        if self.Encryptor.encrypted_block_size() > 256:
+            data = data + bytes(bytearray([rem>>8]))
+        return data
 
     def min_padding_size(self):
         if self.is_encrypted:
@@ -169,7 +174,10 @@ class Cryptography(CryptographyNone):
 
     def remove_padding(self, data):
         if self.is_encrypted:
-            pad_size = bytearray(data[-1:])[0] + 1
+            if self.Decryptor.encrypted_block_size() > 256:
+                pad_size = struct.unpack('<h', data[-2:])[0] + 2
+            else:
+                pad_size = bytearray(data[-1:])[0] + 1
             return data[:-pad_size]
         return data
 
@@ -394,6 +402,7 @@ class SecurityPolicyBasic128Rsa15(SecurityPolicy):
     signature_key_size = 16
     symmetric_key_size = 16
     AsymmetricEncryptionURI = "http://www.w3.org/2001/04/xmlenc#rsa-1_5"
+    AsymmetricSignatureURI = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
 
     @staticmethod
     def encrypt_asymmetric(pubkey, data):
@@ -421,14 +430,17 @@ class SecurityPolicyBasic128Rsa15(SecurityPolicy):
         self.server_certificate = uacrypto.der_from_x509(server_cert)
         self.client_certificate = uacrypto.der_from_x509(client_cert)
 
-    def make_symmetric_key(self, nonce1, nonce2):
+    def make_local_symmetric_key(self, secret, seed):
         key_sizes = (self.signature_key_size, self.symmetric_key_size, 16)
 
-        (sigkey, key, init_vec) = uacrypto.p_sha1(nonce2, nonce1, key_sizes)
+        (sigkey, key, init_vec) = uacrypto.p_sha1(secret, seed, key_sizes)
         self.symmetric_cryptography.Signer = SignerAesCbc(sigkey)
         self.symmetric_cryptography.Encryptor = EncryptorAesCbc(key, init_vec)
 
-        (sigkey, key, init_vec) = uacrypto.p_sha1(nonce1, nonce2, key_sizes)
+    def make_remote_symmetric_key(self, secret, seed):
+        key_sizes = (self.signature_key_size, self.symmetric_key_size, 16)
+
+        (sigkey, key, init_vec) = uacrypto.p_sha1(secret, seed, key_sizes)
         self.symmetric_cryptography.Verifier = VerifierAesCbc(sigkey)
         self.symmetric_cryptography.Decryptor = DecryptorAesCbc(key, init_vec)
 
@@ -465,6 +477,7 @@ class SecurityPolicyBasic256(SecurityPolicy):
     signature_key_size = 24
     symmetric_key_size = 32
     AsymmetricEncryptionURI = "http://www.w3.org/2001/04/xmlenc#rsa-oaep"
+    AsymmetricSignatureURI = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
 
     @staticmethod
     def encrypt_asymmetric(pubkey, data):
@@ -492,15 +505,21 @@ class SecurityPolicyBasic256(SecurityPolicy):
         self.server_certificate = uacrypto.der_from_x509(server_cert)
         self.client_certificate = uacrypto.der_from_x509(client_cert)
 
-    def make_symmetric_key(self, nonce1, nonce2):
+    def make_local_symmetric_key(self, secret, seed):
+
         # specs part 6, 6.7.5
         key_sizes = (self.signature_key_size, self.symmetric_key_size, 16)
 
-        (sigkey, key, init_vec) = uacrypto.p_sha1(nonce2, nonce1, key_sizes)
+        (sigkey, key, init_vec) = uacrypto.p_sha1(secret, seed, key_sizes)
         self.symmetric_cryptography.Signer = SignerAesCbc(sigkey)
         self.symmetric_cryptography.Encryptor = EncryptorAesCbc(key, init_vec)
 
-        (sigkey, key, init_vec) = uacrypto.p_sha1(nonce1, nonce2, key_sizes)
+    def make_remote_symmetric_key(self, secret, seed):
+
+        # specs part 6, 6.7.5
+        key_sizes = (self.signature_key_size, self.symmetric_key_size, 16)
+
+        (sigkey, key, init_vec) = uacrypto.p_sha1(secret, seed, key_sizes)
         self.symmetric_cryptography.Verifier = VerifierAesCbc(sigkey)
         self.symmetric_cryptography.Decryptor = DecryptorAesCbc(key, init_vec)
 
@@ -533,6 +552,7 @@ class SecurityPolicyBasic256Sha256(SecurityPolicy):
     signature_key_size = 32
     symmetric_key_size = 32
     AsymmetricEncryptionURI = "http://www.w3.org/2001/04/xmlenc#rsa-oaep"
+    AsymmetricSignatureURI = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
 
     @staticmethod
     def encrypt_asymmetric(pubkey, data):
@@ -557,15 +577,20 @@ class SecurityPolicyBasic256Sha256(SecurityPolicy):
         self.server_certificate = uacrypto.der_from_x509(server_cert)
         self.client_certificate = uacrypto.der_from_x509(client_cert)
 
-    def make_symmetric_key(self, nonce1, nonce2):
+    def make_local_symmetric_key(self, secret, seed):
         # specs part 6, 6.7.5
         key_sizes = (self.signature_key_size, self.symmetric_key_size, 16)
 
-        (sigkey, key, init_vec) = uacrypto.p_sha256(nonce2, nonce1, key_sizes)
+        (sigkey, key, init_vec) = uacrypto.p_sha256(secret, seed, key_sizes)
         self.symmetric_cryptography.Signer = SignerHMac256(sigkey)
         self.symmetric_cryptography.Encryptor = EncryptorAesCbc(key, init_vec)
 
-        (sigkey, key, init_vec) = uacrypto.p_sha256(nonce1, nonce2, key_sizes)
+    def make_remote_symmetric_key(self, secret, seed):
+
+        # specs part 6, 6.7.5
+        key_sizes = (self.signature_key_size, self.symmetric_key_size, 16)
+
+        (sigkey, key, init_vec) = uacrypto.p_sha256(secret, seed, key_sizes)
         self.symmetric_cryptography.Verifier = VerifierHMac256(sigkey)
         self.symmetric_cryptography.Decryptor = DecryptorAesCbc(key, init_vec)
 
